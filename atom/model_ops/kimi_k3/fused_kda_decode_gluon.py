@@ -84,6 +84,10 @@ def _fused_kda_decode_gluon_kernel(
     hk_v_slice: gl.constexpr = gl.SliceLayout(1, hk_layout)
     hk_k_slice: gl.constexpr = gl.SliceLayout(0, hk_layout)
 
+    # Shared memory for raw output [V], avoids HBM round-trip between Phase 2→3
+    smem_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    smem_out = gl.allocate_shared_memory(tl.float32, [V], smem_layout)
+
     for i_t in range(seq_T):
         tok = bos + i_t
         p_mqkv = mixed_qkv_ptr + tok * stride_mqkv_tok
@@ -201,24 +205,27 @@ def _fused_kda_decode_gluon_kernel(
             # Accumulate sumsq
             o_sumsq = o_sumsq + gl.sum(b_o_cv * b_o_cv)
 
-            # Store raw output
-            p_out_c = out_ptr + tok * (H * V) + i_h * V + o_v
-            gl.store(p_out_c, b_o_cv.to(out_ptr.dtype.element_ty), mask=mask_v)
+            # Store raw output to shared memory (not HBM)
+            smem_chunk = smem_out.slice(i_c * CHUNK_V, CHUNK_V)
+            smem_chunk.store(b_o_cv)
 
         # ============================================================
-        # Phase 3: Gated RMSNorm
+        # Phase 3: Gated RMSNorm (read from shared memory)
         # ============================================================
         rstd = tl.math.rsqrt(o_sumsq / V + norm_eps)
 
         for i_c in gl.static_range(N_CHUNKS):
             o_v = i_c * CHUNK_V + gl.arange(0, CHUNK_V, layout=cv_layout)
             mask_v = o_v < V
-            p_out_c = out_ptr + tok * (H * V) + i_h * V + o_v
-            b_raw = gl.load(p_out_c, mask=mask_v, other=0.0).to(tl.float32)
+
+            smem_chunk = smem_out.slice(i_c * CHUNK_V, CHUNK_V)
+            b_raw = smem_chunk.load(layout=cv_layout)
             b_w = gl.load(norm_weight_ptr + o_v, mask=mask_v, other=0.0).to(tl.float32)
             b_og = gl.load(out_gate_ptr + tok * (H * V) + i_h * V + o_v,
                            mask=mask_v, other=0.0).to(tl.float32)
             b_y = b_raw * rstd * b_w * tl.sigmoid(b_og)
+
+            p_out_c = out_ptr + tok * (H * V) + i_h * V + o_v
             gl.store(p_out_c, b_y.to(out_ptr.dtype.element_ty), mask=mask_v)
 
 
