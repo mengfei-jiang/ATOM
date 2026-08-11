@@ -51,9 +51,11 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.utils import mark_spliting_op
+from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
+
+_USE_FUSED_KDA_DECODE = getattr(envs, "ATOM_USE_FUSED_KDA_DECODE", False)
 
 
 def _text_config(config):
@@ -871,9 +873,30 @@ class KimiKDAAttention(nn.Module):
             ssm_state[state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
         elif gdn_metadata.num_decodes > 0:
-            # Slice the per-token cache-slot indices once (used for both the
-            # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
+            if _USE_FUSED_KDA_DECODE:
+                from atom.model_ops.kimi_k3 import fused_kda_decode_gluon
+
+                fused_out = fused_kda_decode_gluon(
+                    mixed_qkv=mixed_qkv,
+                    conv_state=conv_state,
+                    conv_weight=conv_weights,
+                    gate=gate,
+                    beta=beta,
+                    out_gate=out_gate,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    ssm_state=ssm_state,
+                    ssm_state_indices=decode_state_indices,
+                    cu_seqlens=query_start_loc[: gdn_metadata.num_decodes + 1],
+                    norm_weight=self.o_norm.weight,
+                    norm_eps=self.config.rms_norm_eps,
+                    head_dim=self.head_dim,
+                    num_local_heads=self.num_local_heads,
+                    lower_bound=self._kda_gate_lower_bound,
+                )
+                return self.o_proj(fused_out)
+            # Fallback: original 3-kernel path
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -888,14 +911,6 @@ class KimiKDAAttention(nn.Module):
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            # Fused KDA decode: the kernel gathers the initial state from
-            # ssm_state[decode_state_indices], writes the final state back to
-            # the same slots inplace (inplace_final_state), and writes the
-            # recurrence output straight into `out`. This folds the manual
-            # gather / scatter-back / out.copy_ that the fla path required into
-            # one kernel. is_kda + lower_bound select the per-K-channel,
-            # lower-bounded sigmoid gate that Kimi-KDA uses (beta stays raw
-            # logits; the kernel applies sigmoid in fp32 internally).
             fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
                 a=gate,
