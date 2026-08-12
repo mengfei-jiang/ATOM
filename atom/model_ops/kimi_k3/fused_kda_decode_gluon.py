@@ -5,7 +5,9 @@
 conv1d + delta-rule recurrence + gated RMSNorm.
 
 Grid: (batch, heads) — one block per (sequence, head).
-V dimension processed in CHUNK_V-sized serial chunks.
+Phase 1: Conv1d Q + K + V done once for the full head_dim.
+Phase 2: Delta rule recurrence in V-chunks, V conv result read from LDS.
+Phase 3: Gated RMSNorm, raw output read from LDS.
 """
 
 from __future__ import annotations
@@ -49,34 +51,20 @@ def _fused_kda_decode_gluon_kernel(
     k_base = lp + i_h * K
     v_base = 2 * lp + i_h * V
 
-    # AMD CDNA3: warp_size=64, num_warps=4, total=256 threads.
-    # K=128: sizePerThread=1, threads_per_warp=[64], warps_per_cta=[4]
-    #   → capacity = 1 * 64 * 4 = 256 ≥ 128 ✓
+    # --- Layouts ---
+    # 1D layout for K-sized or V-sized vectors (capacity 256 ≥ 128)
     k_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1], threads_per_warp=[64],
         warps_per_cta=[4], order=[0],
     )
     o_k = gl.arange(0, K, layout=k_layout)
 
-    # CHUNK_V=32: sizePerThread=1, threads_per_warp=[64], warps_per_cta=[4]
-    #   → capacity = 256 ≥ 32 ✓ (masked for o_v < V)
     cv_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1], threads_per_warp=[64],
         warps_per_cta=[4], order=[0],
     )
 
-    # 2D state [CHUNK_V=32, K=128]: sizePerThread=[1,1]
-    # threads_per_warp=[8,8] → 64 ✓
-    # warps_per_cta=[4,1] → 4 ✓
-    # capacity = 1*8*4 × 1*8*1 = 32 × 8 ... need 32×128
-    # Fix: sizePerThread=[1,4], threads_per_warp=[8,8], warps_per_cta=[4,1]
-    #   → dim0 = 1*8*4 = 32 ✓, dim1 = 4*8*1 = 32... need 128
-    # Fix2: sizePerThread=[1,16], threads_per_warp=[4,16], warps_per_cta=[4,1]
-    #   → dim0 = 1*4*4 = 16... need 32
-    # Fix3: sizePerThread=[2,4], threads_per_warp=[4,16], warps_per_cta=[4,1]
-    #   → dim0 = 2*4*4 = 32 ✓, dim1 = 4*16*1 = 64... need 128
-    # Fix4: sizePerThread=[2,8], threads_per_warp=[4,16], warps_per_cta=[4,1]
-    #   → dim0 = 2*4*4 = 32 ✓, dim1 = 8*16*1 = 128 ✓  threads_per_warp = 4*16 = 64 ✓
+    # 2D layout for state [CHUNK_V=32, K=128]
     hk_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[2, 8], threads_per_warp=[4, 16],
         warps_per_cta=[4, 1], order=[1, 0],
@@ -84,9 +72,13 @@ def _fused_kda_decode_gluon_kernel(
     hk_v_slice: gl.constexpr = gl.SliceLayout(1, hk_layout)
     hk_k_slice: gl.constexpr = gl.SliceLayout(0, hk_layout)
 
-    # Shared memory for raw output [V], avoids HBM round-trip between Phase 2→3
+    # --- Shared memory ---
     smem_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    smem_v = gl.allocate_shared_memory(tl.float32, [V], smem_layout)
     smem_out = gl.allocate_shared_memory(tl.float32, [V], smem_layout)
+
+    # V uses same layout as K for the full-dim conv1d pass
+    o_v_full = gl.arange(0, V, layout=k_layout)
 
     for i_t in range(seq_T):
         tok = bos + i_t
@@ -94,27 +86,25 @@ def _fused_kda_decode_gluon_kernel(
         p_cs = conv_state_ptr + state_idx * stride_cs_slot
 
         # ============================================================
-        # Phase 1: Conv1d Q (K channels)
+        # Phase 1: Conv1d Q + K + V (full head_dim, done once)
         # ============================================================
+
+        # --- Q conv1d ---
         p_xq = p_mqkv + q_base + o_k
         b_x_q = gl.load(p_xq).to(tl.float32)
         p_csq = p_cs + (q_base + o_k) * stride_cs_dim
-        # conv accumulation
         b_q = b_x_q * gl.load(conv_weight_ptr + (q_base + o_k) * stride_cw_dim + (W - 1)).to(tl.float32)
         for j in gl.static_range(W - 1):
             cs = gl.load(p_csq + j * stride_cs_pos).to(tl.float32)
             cw = gl.load(conv_weight_ptr + (q_base + o_k) * stride_cw_dim + j).to(tl.float32)
             b_q = b_q + cs * cw
-        b_q = b_q * tl.sigmoid(b_q)  # SiLU
-        # update conv_state
+        b_q = b_q * tl.sigmoid(b_q)
         for j in gl.static_range(W - 2):
             src = gl.load(p_csq + (j + 1) * stride_cs_pos)
             gl.store(p_csq + j * stride_cs_pos, src)
         gl.store(p_csq + (W - 2) * stride_cs_pos, b_x_q.to(p_csq.dtype.element_ty))
 
-        # ============================================================
-        # Phase 1: Conv1d K (K channels)
-        # ============================================================
+        # --- K conv1d ---
         p_xk = p_mqkv + k_base + o_k
         b_x_k = gl.load(p_xk).to(tl.float32)
         p_csk = p_cs + (k_base + o_k) * stride_cs_dim
@@ -129,21 +119,40 @@ def _fused_kda_decode_gluon_kernel(
             gl.store(p_csk + j * stride_cs_pos, src)
         gl.store(p_csk + (W - 2) * stride_cs_pos, b_x_k.to(p_csk.dtype.element_ty))
 
-        # QK L2 Norm
+        # --- V conv1d (full V dim, store to LDS) ---
+        p_xv = p_mqkv + v_base + o_v_full
+        b_x_v = gl.load(p_xv).to(tl.float32)
+        p_csv = p_cs + (v_base + o_v_full) * stride_cs_dim
+        b_v_full = b_x_v * gl.load(
+            conv_weight_ptr + (v_base + o_v_full) * stride_cw_dim + (W - 1)).to(tl.float32)
+        for j in gl.static_range(W - 1):
+            cs = gl.load(p_csv + j * stride_cs_pos).to(tl.float32)
+            cw = gl.load(conv_weight_ptr + (v_base + o_v_full) * stride_cw_dim + j).to(tl.float32)
+            b_v_full = b_v_full + cs * cw
+        b_v_full = b_v_full * tl.sigmoid(b_v_full)
+        for j in gl.static_range(W - 2):
+            src = gl.load(p_csv + (j + 1) * stride_cs_pos)
+            gl.store(p_csv + j * stride_cs_pos, src)
+        gl.store(p_csv + (W - 2) * stride_cs_pos, b_x_v.to(p_csv.dtype.element_ty))
+
+        # Store V conv result to LDS (read per-chunk in Phase 2)
+        smem_v.store(b_v_full)
+
+        # --- QK L2 Norm ---
         b_q = b_q * tl.math.rsqrt(gl.sum(b_q * b_q) + 1e-6) * qk_scale
         b_k = b_k * tl.math.rsqrt(gl.sum(b_k * b_k) + 1e-6)
 
-        # Decay gate
+        # --- Decay gate ---
         b_a = gl.load(gate_ptr + (tok * H + i_h) * K + o_k).to(tl.float32)
         b_dt = gl.load(dt_bias_ptr + i_h * K + o_k).to(tl.float32)
         b_A = gl.load(A_log_ptr + i_h).to(tl.float32)
         b_g = lower_bound * tl.sigmoid(tl.exp(b_A) * (b_a + b_dt))
 
-        # Beta
+        # --- Beta ---
         b_beta = tl.sigmoid(gl.load(beta_ptr + tok * H + i_h).to(tl.float32))
 
         # ============================================================
-        # Phase 2: Delta Rule (V in chunks)
+        # Phase 2: Delta Rule (V in chunks, V conv read from LDS)
         # ============================================================
         o_sumsq = 0.0
 
@@ -151,24 +160,9 @@ def _fused_kda_decode_gluon_kernel(
             o_v = i_c * CHUNK_V + gl.arange(0, CHUNK_V, layout=cv_layout)
             mask_v = o_v < V
 
-            # V conv1d
-            p_xv = p_mqkv + v_base + o_v
-            b_x_v = gl.load(p_xv, mask=mask_v, other=0.0).to(tl.float32)
-            p_csv = p_cs + (v_base + o_v) * stride_cs_dim
-            b_v = b_x_v * gl.load(
-                conv_weight_ptr + (v_base + o_v) * stride_cw_dim + (W - 1),
-                mask=mask_v, other=0.0).to(tl.float32)
-            for j in gl.static_range(W - 1):
-                cs = gl.load(p_csv + j * stride_cs_pos, mask=mask_v, other=0.0).to(tl.float32)
-                cw = gl.load(conv_weight_ptr + (v_base + o_v) * stride_cw_dim + j,
-                             mask=mask_v, other=0.0).to(tl.float32)
-                b_v = b_v + cs * cw
-            b_v = b_v * tl.sigmoid(b_v)
-            for j in gl.static_range(W - 2):
-                src = gl.load(p_csv + (j + 1) * stride_cs_pos, mask=mask_v, other=0.0)
-                gl.store(p_csv + j * stride_cs_pos, src, mask=mask_v)
-            gl.store(p_csv + (W - 2) * stride_cs_pos,
-                     b_x_v.to(p_csv.dtype.element_ty), mask=mask_v)
+            # Read V conv result from LDS (done once in Phase 1)
+            smem_v_chunk = smem_v.slice(i_c * CHUNK_V, CHUNK_V)
+            b_v = smem_v_chunk.load(layout=cv_layout)
 
             # Load state [CHUNK_V, K]
             o_v_2d = gl.arange(0, CHUNK_V, layout=gl.SliceLayout(1, hk_layout))
@@ -205,12 +199,12 @@ def _fused_kda_decode_gluon_kernel(
             # Accumulate sumsq
             o_sumsq = o_sumsq + gl.sum(b_o_cv * b_o_cv)
 
-            # Store raw output to shared memory (not HBM)
-            smem_chunk = smem_out.slice(i_c * CHUNK_V, CHUNK_V)
-            smem_chunk.store(b_o_cv)
+            # Store raw output to LDS
+            smem_out_chunk = smem_out.slice(i_c * CHUNK_V, CHUNK_V)
+            smem_out_chunk.store(b_o_cv)
 
         # ============================================================
-        # Phase 3: Gated RMSNorm (read from shared memory)
+        # Phase 3: Gated RMSNorm (read raw output from LDS)
         # ============================================================
         rstd = tl.math.rsqrt(o_sumsq / V + norm_eps)
 
@@ -218,8 +212,8 @@ def _fused_kda_decode_gluon_kernel(
             o_v = i_c * CHUNK_V + gl.arange(0, CHUNK_V, layout=cv_layout)
             mask_v = o_v < V
 
-            smem_chunk = smem_out.slice(i_c * CHUNK_V, CHUNK_V)
-            b_raw = smem_chunk.load(layout=cv_layout)
+            smem_out_chunk = smem_out.slice(i_c * CHUNK_V, CHUNK_V)
+            b_raw = smem_out_chunk.load(layout=cv_layout)
             b_w = gl.load(norm_weight_ptr + o_v, mask=mask_v, other=0.0).to(tl.float32)
             b_og = gl.load(out_gate_ptr + tok * (H * V) + i_h * V + o_v,
                            mask=mask_v, other=0.0).to(tl.float32)
