@@ -1169,9 +1169,29 @@ class KimiKDAAttention(nn.Module):
             ssm_state[state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
         elif kda_metadata.num_decodes > 0:
-            # Slice the per-token cache-slot indices once (used for both the
-            # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
+            if num_actual_tokens <= 64:
+                from atom.model_ops.kimi_k3 import fused_kda_decode_gluon
+
+                fused_out = fused_kda_decode_gluon(
+                    mixed_qkv=mixed_qkv,
+                    conv_state=conv_state,
+                    conv_weight=conv_weights,
+                    gate=gate,
+                    beta=beta,
+                    out_gate=out_gate,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    ssm_state=ssm_state,
+                    ssm_state_indices=decode_state_indices,
+                    cu_seqlens=query_start_loc[: gdn_metadata.num_decodes + 1],
+                    norm_weight=self.o_norm.weight,
+                    norm_eps=self.config.rms_norm_eps,
+                    head_dim=self.head_dim,
+                    num_local_heads=self.num_local_heads,
+                    lower_bound=self._kda_gate_lower_bound,
+                )
+                return self.o_proj(fused_out)
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
