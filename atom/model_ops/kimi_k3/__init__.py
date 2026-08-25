@@ -10,11 +10,13 @@ from atom.model_ops.kimi_k3.activations import (
     situ_and_mul_quant,
 )
 from atom.model_ops.kimi_k3.attention_residual import apply_attn_res
+from atom.model_ops.kimi_k3.fused_kda_decode_gluon import fused_kda_decode_gluon
 from atom.model_ops.kimi_k3.kda_state import gather_kda_initial_state
 from atom.model_ops.kimi_k3.quant import strided_per_token_quant
 
 __all__ = [
     "apply_attn_res",
+    "fused_kda_decode_gluon",
     "gather_kda_initial_state",
     "rmsnorm_gated",
     "situ_and_mul",
