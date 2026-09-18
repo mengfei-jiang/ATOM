@@ -26,7 +26,53 @@ Source provenance:
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.topk import top_k_per_row_prefill
+
+
+def _prev_pow2(n: int) -> int:
+    if n < 1:
+        return 1
+    return 1 << (n.bit_length() - 1)
+
+
+def _kv_splits_heuristic(
+    T: int,
+    kv_heads: int,
+    topk: int,
+    num_cu: int | None = None,
+    target_wg_per_cu: float = 2.0,
+    max_kv_splits: int = 64,
+) -> int:
+    if topk < 512:
+        return 1
+    if num_cu is None:
+        num_cu = get_cu_num()
+    target_wg = max(1, int(target_wg_per_cu * num_cu))
+    base_ctas = max(1, T * kv_heads)
+    if base_ctas >= target_wg:
+        return 1
+    return _prev_pow2(min(target_wg // base_ctas, max_kv_splits))
+
+
+def _kernel_config(
+    T: int,
+    kv_heads: int,
+    kv_splits: int,
+    num_cu: int | None = None,
+) -> tuple[int, int]:
+    """Pick (BLOCK_N, num_warps) based on grid saturation.
+
+    Small grids need more per-CTA parallelism (wider tiles, more warps).
+    Large grids already saturate the GPU; smaller warps reduce register
+    pressure and improve occupancy.
+    """
+    if num_cu is None:
+        num_cu = get_cu_num()
+    grid_size = T * kv_heads * kv_splits
+    if grid_size <= num_cu:
+        return 64, 4
+    return 32, 2
 
 
 @triton.jit
@@ -1086,6 +1132,8 @@ def _qsa_sparse_paged_gqa_kernel(
     column_offsets = tl.arange(0, BLOCK_N)
 
     partition_size = tl.cdiv(TOPK, KV_SPLITS * BLOCK_N) * BLOCK_N
+    if part * partition_size >= TOPK:
+        return
     for start in tl.range(
         part * partition_size, tl.minimum((part + 1) * partition_size, TOPK), BLOCK_N
     ):
@@ -1124,6 +1172,7 @@ def _qsa_sparse_paged_gqa_kernel(
             + dim_offsets[:, None] * stride_k_dim,
             mask=(dim_offsets[:, None] < HEAD_DIM) & valid[None, :],
             other=0.0,
+            cache_modifier=".cg",
         )
         values = tl.load(
             v_cache_ptr
@@ -1133,6 +1182,7 @@ def _qsa_sparse_paged_gqa_kernel(
             + dim_offsets[None, :] * stride_v_dim,
             mask=valid[:, None] & (dim_offsets[None, :] < HEAD_DIM),
             other=0.0,
+            cache_modifier=".cg",
         )
 
         scores = tl.where(valid[None, :], tl.dot(query, keys), -1.0e20)
@@ -1227,23 +1277,18 @@ def qsa_sparse_paged_gqa(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = max(16, triton.next_power_of_2(group_size))
     block_d = max(16, triton.next_power_of_2(q.shape[2]))
-    block_n = 32
     if kv_splits is None:
-        # Keep decode reduction order independent of the verification width.
-        # Prefill continues to size parallelism from its flat query rows.
         split_rows = q.shape[0] if num_decode_requests is None else num_decode_requests
         if split_rows <= 0:
             raise ValueError("num_decode_requests must be positive")
-        kv_splits = (
-            min(
-                16,
-                triton.next_power_of_2(triton.cdiv(512, split_rows * k_cache.shape[2])),
-            )
-            if logical_indices.shape[1] >= 512
-            else 1
+        kv_splits = _kv_splits_heuristic(
+            split_rows, k_cache.shape[2], logical_indices.shape[1]
         )
     if kv_splits < 1 or kv_splits & (kv_splits - 1):
         raise ValueError("kv_splits must be a positive power of two")
+    block_n, num_warps = _kernel_config(
+        q.shape[0], k_cache.shape[2], kv_splits
+    )
     if logical_indices.shape[1] == 0:
         # Empty selections produce zero attention output; skip split reduction.
         return out.zero_()
@@ -1299,8 +1344,8 @@ def qsa_sparse_paged_gqa(
         BLOCK_N=block_n,
         BLOCK_D=block_d,
         KV_SPLITS=kv_splits,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=1,
     )
     if kv_splits > 1:
         from aiter.ops.triton._triton_kernels.attention.mla import (
