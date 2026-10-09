@@ -81,6 +81,7 @@ def _gluon_kda_recurrent_kernel(
     # Constexprs — mode flags
     USE_REPLAY: gl.constexpr,
     IS_SPEC: gl.constexpr,
+    SPEC_LEN: gl.constexpr,
     # Strides — conv
     stride_x_tok: tl.int64,
     stride_cw_group: tl.int64,
@@ -166,48 +167,40 @@ def _gluon_kda_recurrent_kernel(
     cw_v_base = 2 * stride_cw_group + i_h * V * stride_cw_ch
 
     # --- Layouts ---
+    # k_layout: 1-D, full K parallelism (128 threads × 1 elem) for conv1d Q/K.
     k_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1],
         threads_per_warp=[64],
-        warps_per_cta=[4],
+        warps_per_cta=[2],
         order=[0],
     )
     o_k = gl.arange(0, K, layout=k_layout)
 
-    cv_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1],
-        threads_per_warp=[64],
-        warps_per_cta=[4],
-        order=[0],
-    )
-
+    # hk_layout: 2-D [CHUNK_V, K] for delta-rule state matrix.
     hk_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[CHUNK_V // 16, 8],
+        size_per_thread=[CHUNK_V // 8, 8],
         threads_per_warp=[4, 16],
-        warps_per_cta=[4, 1],
+        warps_per_cta=[2, 1],
         order=[1, 0],
     )
     hk_v_slice: gl.constexpr = gl.SliceLayout(1, hk_layout)
     hk_k_slice: gl.constexpr = gl.SliceLayout(0, hk_layout)
 
-    o_v_full = gl.arange(0, V, layout=k_layout)
-
-    # Shared memory for batched Q/K/g layout conversion (k_layout → hk_k_slice)
-    smem_qkg_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
-    smem_qkg = gl.allocate_shared_memory(tl.float32, [512], smem_qkg_layout)
-
-    # V-chunk offset for this block
-    o_v_chunk = i_c * CHUNK_V + gl.arange(0, CHUNK_V, layout=cv_layout)
+    o_v_chunk = i_c * CHUNK_V + gl.arange(0, CHUNK_V, layout=hk_v_slice)
     mask_v_chunk = o_v_chunk < V
 
     p_cs = conv_state_ptr + conv_slot * stride_cs_slot
+
+    # Shared memory for batched layout convert: pack Q, K, G (3 × K)
+    # in k_layout, load back in hk_k_slice with a single barrier pair.
+    smem_cvt_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    smem_qkg = gl.allocate_shared_memory(tl.float32, [4 * K], smem_cvt_layout)
 
     # ================================================================
     # USE_REPLAY: checkpoint rebuild (same as original, only on i_c==0
     # for the smem-based parts; state write-back for all chunks)
     # ================================================================
     if USE_REPLAY:
-        smem_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
         smem_gk_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
         smem_kw_hist = gl.allocate_shared_memory(tl.float32, [BH * K], smem_gk_layout)
         smem_exp_ctot = gl.allocate_shared_memory(tl.float32, [K], smem_gk_layout)
@@ -215,13 +208,13 @@ def _gluon_kda_recurrent_kernel(
             b_ctot = (o_k - o_k).to(tl.float32)
             for h_i in gl.static_range(BH):
                 if h_i < h_cursor:
-                    g_val = gl.load(
-                        buf_g_ptr + slot * stride_bufg_slot
-                        + i_h * stride_bufg_hv + h_i * stride_bufg_pos + o_k,
+                    g_val = gl.amd.cdna4.buffer_load(
+                        ptr=buf_g_ptr + slot * stride_bufg_slot + i_h * stride_bufg_hv + h_i * stride_bufg_pos,
+                        offsets=o_k,
                     ).to(tl.float32)
-                    k_val = gl.load(
-                        buf_k_ptr + slot * stride_bufk_slot
-                        + i_h * stride_bufk_hv + h_i * stride_bufk_pos + o_k,
+                    k_val = gl.amd.cdna4.buffer_load(
+                        ptr=buf_k_ptr + slot * stride_bufk_slot + i_h * stride_bufk_hv + h_i * stride_bufk_pos,
+                        offsets=o_k,
                     ).to(tl.float32)
                     b_ctot = b_ctot + g_val
                     smem_kw_hist.slice(h_i * K, K).store(k_val)
@@ -229,9 +222,9 @@ def _gluon_kda_recurrent_kernel(
             b_prefix = (o_k - o_k).to(tl.float32)
             for h_i in gl.static_range(BH):
                 if h_i < h_cursor:
-                    g_val = gl.load(
-                        buf_g_ptr + slot * stride_bufg_slot
-                        + i_h * stride_bufg_hv + h_i * stride_bufg_pos + o_k,
+                    g_val = gl.amd.cdna4.buffer_load(
+                        ptr=buf_g_ptr + slot * stride_bufg_slot + i_h * stride_bufg_hv + h_i * stride_bufg_pos,
+                        offsets=o_k,
                     ).to(tl.float32)
                     k_val = smem_kw_hist.slice(h_i * K, K).load(layout=k_layout)
                     b_prefix = b_prefix + g_val
@@ -243,37 +236,38 @@ def _gluon_kda_recurrent_kernel(
         # Replay for this V-chunk only
         o_v_2d = gl.arange(0, CHUNK_V, layout=gl.SliceLayout(1, hk_layout))
         o_k_2d = gl.arange(0, K, layout=gl.SliceLayout(0, hk_layout))
-        o_v_hk = gl.arange(0, CHUNK_V, layout=hk_v_slice)
 
         mask_h = ((i_c * CHUNK_V + o_v_2d)[:, None] < V) & (o_k_2d[None, :] < K)
-        p_ckpt = (
-            ckpt_ptr + slot * stride_ckpt_slot + i_h * V * K
-            + (i_c * CHUNK_V + o_v_2d)[:, None] * K + o_k_2d[None, :]
-        )
-        b_h = gl.load(p_ckpt, mask=mask_h, other=0.0).to(tl.float32)
+        _hk_off_replay = ((i_c * CHUNK_V + o_v_2d)[:, None] * K + o_k_2d[None, :]).to(tl.int32)
+        ckpt_base = ckpt_ptr + slot * stride_ckpt_slot + i_h * V * K
+        b_h = gl.amd.cdna4.buffer_load(ptr=ckpt_base, offsets=_hk_off_replay, mask=mask_h, other=0.0).to(tl.float32)
 
         if h_cursor > 0:
             b_decay = smem_exp_ctot.slice(0, K).load(layout=hk_k_slice)
             b_h = b_h * b_decay[None, :]
 
-            p_u_base = (buf_u_ptr + slot * stride_bufu_slot + i_h * stride_bufu_hv)
+            _bufu_v_off = (i_c * CHUNK_V + gl.arange(0, CHUNK_V, layout=hk_v_slice)).to(tl.int32)
             for h_i in gl.static_range(BH):
                 if h_i < h_cursor:
                     b_kw = smem_kw_hist.slice(h_i * K, K).load(layout=hk_k_slice)
-                    b_u = gl.load(
-                        p_u_base + h_i * stride_bufu_pos + (i_c * CHUNK_V + o_v_hk),
-                        mask=o_v_hk < CHUNK_V, other=0.0,
+                    b_u = gl.amd.cdna4.buffer_load(
+                        ptr=buf_u_ptr + slot * stride_bufu_slot + i_h * stride_bufu_hv + h_i * stride_bufu_pos,
+                        offsets=_bufu_v_off,
+                        mask=_bufu_v_off < V, other=0.0,
                     ).to(tl.float32)
                     b_h = b_h + b_u[:, None] * b_kw[None, :]
 
         if do_flush:
-            gl.store(p_ckpt, b_h.to(ckpt_ptr.dtype.element_ty), mask=mask_h)
+            gl.amd.cdna4.buffer_store(
+                stored_value=b_h.to(ckpt_ptr.dtype.element_ty),
+                ptr=ckpt_base, offsets=_hk_off_replay, mask=mask_h,
+            )
 
-        p_ssm = (
-            ssm_state_ptr + state_idx * stride_ssm_slot + i_h * V * K
-            + (i_c * CHUNK_V + o_v_2d)[:, None] * K + o_k_2d[None, :]
+        ssm_replay_base = ssm_state_ptr + state_idx * stride_ssm_slot + i_h * V * K
+        gl.amd.cdna4.buffer_store(
+            stored_value=b_h.to(ssm_state_ptr.dtype.element_ty),
+            ptr=ssm_replay_base, offsets=_hk_off_replay, mask=mask_h,
         )
-        gl.store(p_ssm, b_h.to(ssm_state_ptr.dtype.element_ty), mask=mask_h)
 
     # ================================================================
     # Pre-load conv history + weights into registers (both paths)
@@ -284,39 +278,43 @@ def _gluon_kda_recurrent_kernel(
     else:
         cs_off = bos - bos  # = 0
 
-    p_csq_base = p_cs + (q_ch_off + o_k) * stride_cs_dim
-    p_csk_base = p_cs + (k_ch_off + o_k) * stride_cs_dim
-    b_colq0 = gl.load(p_csq_base + (cs_off + 0) * stride_cs_pos).to(tl.float32)
-    b_colq1 = gl.load(p_csq_base + (cs_off + 1) * stride_cs_pos).to(tl.float32)
-    b_colq2 = gl.load(p_csq_base + (cs_off + 2) * stride_cs_pos).to(tl.float32)
-    b_colk0 = gl.load(p_csk_base + (cs_off + 0) * stride_cs_pos).to(tl.float32)
-    b_colk1 = gl.load(p_csk_base + (cs_off + 1) * stride_cs_pos).to(tl.float32)
-    b_colk2 = gl.load(p_csk_base + (cs_off + 2) * stride_cs_pos).to(tl.float32)
-    p_csv_chunk_init = p_cs + (v_ch_off + o_v_chunk) * stride_cs_dim
-    b_colv0_c = gl.load(p_csv_chunk_init + (cs_off + 0) * stride_cs_pos).to(tl.float32)
-    b_colv1_c = gl.load(p_csv_chunk_init + (cs_off + 1) * stride_cs_pos).to(tl.float32)
-    b_colv2_c = gl.load(p_csv_chunk_init + (cs_off + 2) * stride_cs_pos).to(tl.float32)
+    _csq_off = ((q_ch_off + o_k) * stride_cs_dim).to(tl.int32)
+    _csk_off = ((k_ch_off + o_k) * stride_cs_dim).to(tl.int32)
+    _csv_off = ((v_ch_off + o_v_chunk) * stride_cs_dim).to(tl.int32)
+    b_colq0 = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 0) * stride_cs_pos, offsets=_csq_off).to(tl.float32)
+    b_colq1 = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 1) * stride_cs_pos, offsets=_csq_off).to(tl.float32)
+    b_colq2 = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 2) * stride_cs_pos, offsets=_csq_off).to(tl.float32)
+    b_colk0 = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 0) * stride_cs_pos, offsets=_csk_off).to(tl.float32)
+    b_colk1 = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 1) * stride_cs_pos, offsets=_csk_off).to(tl.float32)
+    b_colk2 = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 2) * stride_cs_pos, offsets=_csk_off).to(tl.float32)
+    b_colv0_c = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 0) * stride_cs_pos, offsets=_csv_off).to(tl.float32)
+    b_colv1_c = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 1) * stride_cs_pos, offsets=_csv_off).to(tl.float32)
+    b_colv2_c = gl.amd.cdna4.buffer_load(ptr=p_cs + (cs_off + 2) * stride_cs_pos, offsets=_csv_off).to(tl.float32)
 
     # ================================================================
     # Hoist token-loop-invariant loads
     # ================================================================
     b_A = gl.load(A_log_ptr + i_h).to(tl.float32)
-    b_dt = gl.load(dt_bias_ptr + i_h * K + o_k).to(tl.float32)
+    b_exp_A = tl.exp(b_A)
+    b_dt = gl.amd.cdna4.buffer_load(ptr=dt_bias_ptr + i_h * K, offsets=o_k).to(tl.float32)
 
-    o_v_local = gl.arange(0, CHUNK_V, layout=cv_layout)
+    o_v_local = gl.arange(0, CHUNK_V, layout=hk_v_slice)
     cw_v_chunk_base = cw_v_base + i_c * CHUNK_V * stride_cw_ch
-    b_wvc0 = gl.load(conv_weight_ptr + cw_v_chunk_base + o_v_local * stride_cw_ch + 0 * stride_cw_width).to(tl.float32)
-    b_wvc1 = gl.load(conv_weight_ptr + cw_v_chunk_base + o_v_local * stride_cw_ch + 1 * stride_cw_width).to(tl.float32)
-    b_wvc2 = gl.load(conv_weight_ptr + cw_v_chunk_base + o_v_local * stride_cw_ch + 2 * stride_cw_width).to(tl.float32)
-    b_wvc3 = gl.load(conv_weight_ptr + cw_v_chunk_base + o_v_local * stride_cw_ch + (W - 1) * stride_cw_width).to(tl.float32)
-    b_wq0 = gl.load(conv_weight_ptr + cw_q_base + o_k * stride_cw_ch + 0 * stride_cw_width).to(tl.float32)
-    b_wq1 = gl.load(conv_weight_ptr + cw_q_base + o_k * stride_cw_ch + 1 * stride_cw_width).to(tl.float32)
-    b_wq2 = gl.load(conv_weight_ptr + cw_q_base + o_k * stride_cw_ch + 2 * stride_cw_width).to(tl.float32)
-    b_wq3 = gl.load(conv_weight_ptr + cw_q_base + o_k * stride_cw_ch + (W - 1) * stride_cw_width).to(tl.float32)
-    b_wk0 = gl.load(conv_weight_ptr + cw_k_base + o_k * stride_cw_ch + 0 * stride_cw_width).to(tl.float32)
-    b_wk1 = gl.load(conv_weight_ptr + cw_k_base + o_k * stride_cw_ch + 1 * stride_cw_width).to(tl.float32)
-    b_wk2 = gl.load(conv_weight_ptr + cw_k_base + o_k * stride_cw_ch + 2 * stride_cw_width).to(tl.float32)
-    b_wk3 = gl.load(conv_weight_ptr + cw_k_base + o_k * stride_cw_ch + (W - 1) * stride_cw_width).to(tl.float32)
+    _cwv_off = (o_v_local * stride_cw_ch).to(tl.int32)
+    _cwq_off = (o_k * stride_cw_ch).to(tl.int32)
+    _cwk_off = (o_k * stride_cw_ch).to(tl.int32)
+    b_wvc0 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_v_chunk_base + 0 * stride_cw_width, offsets=_cwv_off).to(tl.float32)
+    b_wvc1 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_v_chunk_base + 1 * stride_cw_width, offsets=_cwv_off).to(tl.float32)
+    b_wvc2 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_v_chunk_base + 2 * stride_cw_width, offsets=_cwv_off).to(tl.float32)
+    b_wvc3 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_v_chunk_base + (W - 1) * stride_cw_width, offsets=_cwv_off).to(tl.float32)
+    b_wq0 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_q_base + 0 * stride_cw_width, offsets=_cwq_off).to(tl.float32)
+    b_wq1 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_q_base + 1 * stride_cw_width, offsets=_cwq_off).to(tl.float32)
+    b_wq2 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_q_base + 2 * stride_cw_width, offsets=_cwq_off).to(tl.float32)
+    b_wq3 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_q_base + (W - 1) * stride_cw_width, offsets=_cwq_off).to(tl.float32)
+    b_wk0 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_k_base + 0 * stride_cw_width, offsets=_cwk_off).to(tl.float32)
+    b_wk1 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_k_base + 1 * stride_cw_width, offsets=_cwk_off).to(tl.float32)
+    b_wk2 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_k_base + 2 * stride_cw_width, offsets=_cwk_off).to(tl.float32)
+    b_wk3 = gl.amd.cdna4.buffer_load(ptr=conv_weight_ptr + cw_k_base + (W - 1) * stride_cw_width, offsets=_cwk_off).to(tl.float32)
 
     # ================================================================
     # Load state ONCE before the token loop (keep in registers across tokens)
@@ -324,84 +322,48 @@ def _gluon_kda_recurrent_kernel(
     o_v_2d = gl.arange(0, CHUNK_V, layout=gl.SliceLayout(1, hk_layout))
     o_k_2d = gl.arange(0, K, layout=gl.SliceLayout(0, hk_layout))
     mask_h = ((i_c * CHUNK_V + o_v_2d)[:, None] < V) & (o_k_2d[None, :] < K)
-    p_h = p_state_base + (i_c * CHUNK_V + o_v_2d)[:, None] * K + o_k_2d[None, :]
-    b_h = gl.load(p_h, mask=mask_h, other=0.0).to(tl.float32)
+    _hk_off_2d = ((i_c * CHUNK_V + o_v_2d)[:, None] * K + o_k_2d[None, :]).to(tl.int32)
+    b_h = gl.amd.cdna4.buffer_load(ptr=p_state_base, offsets=_hk_off_2d, mask=mask_h, other=0.0).to(tl.float32)
 
-    # Per-token loop
+    # Per-token loop — static_range for IS_SPEC (constexpr unrolling)
     # ================================================================
-    for i_t in range(seq_T):
+    loop_len = SPEC_LEN if IS_SPEC else seq_T
+    for i_t in range(loop_len):
         tok = bos + i_t
-        p_x = x_ptr + tok * stride_x_tok
+        p_x_tok = x_ptr + tok * stride_x_tok
 
         # ============================================================
-        # Phase 1: Conv1d Q + K (full) + V
-        # Issue gate+beta loads early to overlap with conv1d compute
+        # Phase 1: Conv1d Q/K in k_layout, V in hk_v_slice
         # ============================================================
-        if IS_SPEC:
-            # Issue ALL loads upfront (x_q, x_k, x_v, gate, beta)
-            # so they overlap with conv1d compute
-            b_x_q = gl.load(p_x + q_ch_off + o_k).to(tl.float32)
-            b_x_k = gl.load(p_x + k_ch_off + o_k).to(tl.float32)
-            b_x_v_c = gl.load(p_x + v_ch_off + o_v_chunk).to(tl.float32)
-            b_a_early = gl.load(gate_ptr + (tok * H + i_h) * K + o_k).to(tl.float32)
-            b_beta_early = gl.load(beta_ptr + tok * stride_beta_tok + i_h).to(tl.float32)
+        b_x_q = gl.amd.cdna4.buffer_load(ptr=p_x_tok + q_ch_off, offsets=o_k).to(tl.float32)
+        b_x_k = gl.amd.cdna4.buffer_load(ptr=p_x_tok + k_ch_off, offsets=o_k).to(tl.float32)
+        b_x_v_c = gl.amd.cdna4.buffer_load(ptr=p_x_tok + v_ch_off, offsets=o_v_chunk).to(tl.float32)
 
-            b_q = b_colq0 * b_wq0 + b_colq1 * b_wq1 + b_colq2 * b_wq2 + b_x_q * b_wq3
-            b_q = b_q * tl.sigmoid(b_q)
+        b_q = b_colq0 * b_wq0 + b_colq1 * b_wq1 + b_colq2 * b_wq2 + b_x_q * b_wq3
+        b_q = b_q * tl.sigmoid(b_q)
 
-            b_k = b_colk0 * b_wk0 + b_colk1 * b_wk1 + b_colk2 * b_wk2 + b_x_k * b_wk3
-            b_k = b_k * tl.sigmoid(b_k)
+        b_k = b_colk0 * b_wk0 + b_colk1 * b_wk1 + b_colk2 * b_wk2 + b_x_k * b_wk3
+        b_k = b_k * tl.sigmoid(b_k)
 
-            b_colq0 = b_colq1
-            b_colq1 = b_colq2
-            b_colq2 = b_x_q
-            b_colk0 = b_colk1
-            b_colk1 = b_colk2
-            b_colk2 = b_x_k
+        b_v = b_colv0_c * b_wvc0 + b_colv1_c * b_wvc1 + b_colv2_c * b_wvc2 + b_x_v_c * b_wvc3
+        b_v = b_v * tl.sigmoid(b_v)
 
-            # V conv1d
-            b_v = b_colv0_c * b_wvc0 + b_colv1_c * b_wvc1 + b_colv2_c * b_wvc2 + b_x_v_c * b_wvc3
-            b_v = b_v * tl.sigmoid(b_v)
-            b_colv0_c = b_colv1_c
-            b_colv1_c = b_colv2_c
-            b_colv2_c = b_x_v_c
+        b_colq0 = b_colq1
+        b_colq1 = b_colq2
+        b_colq2 = b_x_q
+        b_colk0 = b_colk1
+        b_colk1 = b_colk2
+        b_colk2 = b_x_k
+        b_colv0_c = b_colv1_c
+        b_colv1_c = b_colv2_c
+        b_colv2_c = b_x_v_c
 
-        else:
-            # Non-spec: register sliding window (same as IS_SPEC, avoids
-            # conv_state read/write race across V-chunk blocks)
-            b_x_q = gl.load(p_x + q_ch_off + o_k).to(tl.float32)
-            b_x_k = gl.load(p_x + k_ch_off + o_k).to(tl.float32)
-            b_x_v_c = gl.load(p_x + v_ch_off + o_v_chunk).to(tl.float32)
-
-            b_q = b_colq0 * b_wq0 + b_colq1 * b_wq1 + b_colq2 * b_wq2 + b_x_q * b_wq3
-            b_q = b_q * tl.sigmoid(b_q)
-
-            b_k = b_colk0 * b_wk0 + b_colk1 * b_wk1 + b_colk2 * b_wk2 + b_x_k * b_wk3
-            b_k = b_k * tl.sigmoid(b_k)
-
-            b_v = b_colv0_c * b_wvc0 + b_colv1_c * b_wvc1 + b_colv2_c * b_wvc2 + b_x_v_c * b_wvc3
-            b_v = b_v * tl.sigmoid(b_v)
-
-            b_colq0 = b_colq1
-            b_colq1 = b_colq2
-            b_colq2 = b_x_q
-            b_colk0 = b_colk1
-            b_colk1 = b_colk2
-            b_colk2 = b_x_k
-            b_colv0_c = b_colv1_c
-            b_colv1_c = b_colv2_c
-            b_colv2_c = b_x_v_c
-
-        # Gate computation (use early-loaded values for IS_SPEC)
-        if IS_SPEC:
-            b_g = lower_bound * tl.sigmoid(tl.exp(b_A) * (b_a_early + b_dt))
-            b_beta = tl.sigmoid(b_beta_early)
-        else:
-            b_a = gl.load(gate_ptr + (tok * H + i_h) * K + o_k).to(tl.float32)
-            b_g = lower_bound * tl.sigmoid(tl.exp(b_A) * (b_a + b_dt))
-            b_beta = tl.sigmoid(
-                gl.load(beta_ptr + tok * stride_beta_tok + i_h).to(tl.float32)
-            )
+        # Gate + beta
+        b_a = gl.amd.cdna4.buffer_load(ptr=gate_ptr + (tok * H + i_h) * K, offsets=o_k).to(tl.float32)
+        b_g = lower_bound * tl.sigmoid(b_exp_A * (b_a + b_dt))
+        b_beta = tl.sigmoid(
+            gl.load(beta_ptr + tok * stride_beta_tok + i_h).to(tl.float32)
+        )
 
         # IS_SPEC per-token snapshot index
         if IS_SPEC and not USE_REPLAY:
@@ -409,82 +371,76 @@ def _gluon_kda_recurrent_kernel(
                 state_indices_ptr + i_n * stride_si_seq + i_t * stride_si_tok
             ).to(tl.int64)
 
-        # QK L2 Norm in k_layout, then convert to hk_k_slice
+        # L2 norm + exp(gate) in k_layout (128 parallel threads), then
+        # batch-convert Q/K/exp(G) via shared memory (1 barrier pair).
         b_q = b_q * tl.math.rsqrt(gl.sum(b_q * b_q) + 1e-6) * qk_scale
         b_k = b_k * tl.math.rsqrt(gl.sum(b_k * b_k) + 1e-6)
-        b_g_2d = gl.convert_layout(b_g, layout=hk_k_slice)
-        b_k_2d = gl.convert_layout(b_k, layout=hk_k_slice)
-        b_q_2d = gl.convert_layout(b_q, layout=hk_k_slice)
-
-        b_exp_g = tl.exp(b_g_2d)
+        smem_qkg.slice(0, K).store(b_q)
+        smem_qkg.slice(K, K).store(b_k)
+        smem_qkg.slice(2 * K, K).store(tl.exp(b_g))
+        b_q_2d = smem_qkg.slice(0, K).load(layout=hk_k_slice)
+        b_k_2d = smem_qkg.slice(K, K).load(layout=hk_k_slice)
+        b_exp_g = smem_qkg.slice(2 * K, K).load(layout=hk_k_slice)
 
         b_h = b_h * b_exp_g[None, :]
 
         b_dot = gl.sum(b_h * b_k_2d[None, :], axis=1)
-        b_dot_cv = gl.convert_layout(b_dot, layout=cv_layout)
-        b_v = b_v - b_dot_cv
+        b_v = b_v - b_dot
         b_v = b_v * b_beta
-        b_v_2d = gl.convert_layout(b_v, layout=hk_v_slice)
-        b_h = b_h + b_v_2d[:, None] * b_k_2d[None, :]
+        b_h = b_h + b_v[:, None] * b_k_2d[None, :]
 
         # USE_REPLAY: write u record for this V-chunk
         if USE_REPLAY:
             pos = base + i_t
-            o_v = i_c * CHUNK_V + gl.arange(0, CHUNK_V, layout=cv_layout)
-            gl.store(
-                buf_u_ptr
-                + slot * stride_bufu_slot
-                + i_h * stride_bufu_hv
-                + pos * stride_bufu_pos
-                + o_v,
-                b_v.to(buf_u_ptr.dtype.element_ty),
-                mask=o_v < V,
+            gl.amd.cdna4.buffer_store(
+                stored_value=b_v.to(buf_u_ptr.dtype.element_ty),
+                ptr=buf_u_ptr + slot * stride_bufu_slot + i_h * stride_bufu_hv + pos * stride_bufu_pos,
+                offsets=o_v_chunk,
+                mask=mask_v_chunk,
             )
 
         b_o = gl.sum(b_h * b_q_2d[None, :], axis=1)
-        b_o_cv = gl.convert_layout(b_o, layout=cv_layout)
 
         # State snapshot
         if USE_REPLAY:
-            gl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
+            gl.amd.cdna4.buffer_store(
+                stored_value=b_h.to(ssm_state_ptr.dtype.element_ty),
+                ptr=p_state_base, offsets=_hk_off_2d, mask=mask_h,
+            )
         elif IS_SPEC:
             if final_idx >= 0:
-                p_snap = (
-                    ssm_state_ptr
-                    + final_idx * stride_ssm_slot
-                    + i_h * V * K
-                    + (i_c * CHUNK_V + o_v_2d)[:, None] * K
-                    + o_k_2d[None, :]
+                gl.amd.cdna4.buffer_store(
+                    stored_value=b_h.to(ssm_state_ptr.dtype.element_ty),
+                    ptr=ssm_state_ptr + final_idx * stride_ssm_slot + i_h * V * K,
+                    offsets=_hk_off_2d, mask=mask_h, cache=".cs",
                 )
-                gl.store(p_snap, b_h.to(ssm_state_ptr.dtype.element_ty), mask=mask_h,
-                         cache_modifier=".cs")
 
         # USE_REPLAY: write k and g records (only i_c==0, once per token)
         if USE_REPLAY and i_c == 0:
             pos = base + i_t
-            gl.store(
-                buf_k_ptr
-                + slot * stride_bufk_slot
-                + i_h * stride_bufk_hv
-                + pos * stride_bufk_pos
-                + o_k,
-                b_k.to(buf_k_ptr.dtype.element_ty),
+            gl.amd.cdna4.buffer_store(
+                stored_value=b_k.to(buf_k_ptr.dtype.element_ty),
+                ptr=buf_k_ptr + slot * stride_bufk_slot + i_h * stride_bufk_hv + pos * stride_bufk_pos,
+                offsets=o_k,
             )
-            gl.store(
-                buf_g_ptr
-                + slot * stride_bufg_slot
-                + i_h * stride_bufg_hv
-                + pos * stride_bufg_pos
-                + o_k,
-                b_g.to(buf_g_ptr.dtype.element_ty),
+            gl.amd.cdna4.buffer_store(
+                stored_value=b_g.to(buf_g_ptr.dtype.element_ty),
+                ptr=buf_g_ptr + slot * stride_bufg_slot + i_h * stride_bufg_hv + pos * stride_bufg_pos,
+                offsets=o_k,
             )
 
         # Write un-normalized output to out_ptr at this chunk's V-slice
-        p_out = out_ptr + tok * (H * V) + i_h * V + o_v_chunk
-        gl.store(p_out, b_o_cv.to(out_ptr.dtype.element_ty), mask=mask_v_chunk)
+        gl.amd.cdna4.buffer_store(
+            stored_value=b_o.to(out_ptr.dtype.element_ty),
+            ptr=out_ptr + tok * (H * V) + i_h * V,
+            offsets=o_v_chunk, mask=mask_v_chunk,
+        )
 
     # Store final state ONCE after the token loop (was in registers throughout)
-    gl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
+    gl.amd.cdna4.buffer_store(
+        stored_value=b_h.to(ssm_state_ptr.dtype.element_ty),
+        ptr=p_state_base, offsets=_hk_off_2d, mask=mask_h,
+    )
 
     # ================================================================
     # Conv_state write-back after the token loop (register → global).
@@ -493,55 +449,43 @@ def _gluon_kda_recurrent_kernel(
     # ================================================================
     if not IS_SPEC:
         if i_c == 0:
-            # Q/K conv state: write final sliding window [col1, col2, last_x]
-            # For W=4, STATE_LEN=3: positions [0,1,2] = [colq1, colq2, last_x_q]
-            # But b_colq0/1/2 after the loop hold the final shifted values:
-            # b_colq0 = second-to-last history, b_colq1 = last history, b_colq2 = last x
-            p_csq_wb = p_cs + (q_ch_off + o_k) * stride_cs_dim
-            p_csk_wb = p_cs + (k_ch_off + o_k) * stride_cs_dim
-            gl.store(p_csq_wb + 0 * stride_cs_pos, b_colq0.to(p_csq_wb.dtype.element_ty))
-            gl.store(p_csq_wb + 1 * stride_cs_pos, b_colq1.to(p_csq_wb.dtype.element_ty))
-            gl.store(p_csq_wb + 2 * stride_cs_pos, b_colq2.to(p_csq_wb.dtype.element_ty))
-            gl.store(p_csk_wb + 0 * stride_cs_pos, b_colk0.to(p_csk_wb.dtype.element_ty))
-            gl.store(p_csk_wb + 1 * stride_cs_pos, b_colk1.to(p_csk_wb.dtype.element_ty))
-            gl.store(p_csk_wb + 2 * stride_cs_pos, b_colk2.to(p_csk_wb.dtype.element_ty))
-        # V conv state: each block writes its chunk
-        p_csv_wb = p_cs + (v_ch_off + o_v_chunk) * stride_cs_dim
-        gl.store(p_csv_wb + 0 * stride_cs_pos, b_colv0_c.to(p_csv_wb.dtype.element_ty))
-        gl.store(p_csv_wb + 1 * stride_cs_pos, b_colv1_c.to(p_csv_wb.dtype.element_ty))
-        gl.store(p_csv_wb + 2 * stride_cs_pos, b_colv2_c.to(p_csv_wb.dtype.element_ty))
+            gl.amd.cdna4.buffer_store(b_colq0.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 0 * stride_cs_pos, offsets=_csq_off)
+            gl.amd.cdna4.buffer_store(b_colq1.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 1 * stride_cs_pos, offsets=_csq_off)
+            gl.amd.cdna4.buffer_store(b_colq2.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 2 * stride_cs_pos, offsets=_csq_off)
+            gl.amd.cdna4.buffer_store(b_colk0.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 0 * stride_cs_pos, offsets=_csk_off)
+            gl.amd.cdna4.buffer_store(b_colk1.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 1 * stride_cs_pos, offsets=_csk_off)
+            gl.amd.cdna4.buffer_store(b_colk2.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 2 * stride_cs_pos, offsets=_csk_off)
+        gl.amd.cdna4.buffer_store(b_colv0_c.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 0 * stride_cs_pos, offsets=_csv_off)
+        gl.amd.cdna4.buffer_store(b_colv1_c.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 1 * stride_cs_pos, offsets=_csv_off)
+        gl.amd.cdna4.buffer_store(b_colv2_c.to(conv_state_ptr.dtype.element_ty), ptr=p_cs + 2 * stride_cs_pos, offsets=_csv_off)
 
     elif IS_SPEC:
         if i_c == 0:
-            p_csq_base = p_cs + (q_ch_off + o_k) * stride_cs_dim
-            p_csk_base = p_cs + (k_ch_off + o_k) * stride_cs_dim
-            val = STATE_LEN - seq_T
             for idx in gl.static_range(STATE_LEN):
-                if idx + seq_T < STATE_LEN:
+                if idx + SPEC_LEN < STATE_LEN:
                     src_pos = (i_t_start + 1 + idx) * stride_cs_pos
-                    gl.store(p_csq_base + idx * stride_cs_pos, gl.load(p_csq_base + src_pos))
-                    gl.store(p_csk_base + idx * stride_cs_pos, gl.load(p_csk_base + src_pos))
+                    gl.amd.cdna4.buffer_store(gl.amd.cdna4.buffer_load(ptr=p_cs + src_pos, offsets=_csq_off), ptr=p_cs + idx * stride_cs_pos, offsets=_csq_off)
+                    gl.amd.cdna4.buffer_store(gl.amd.cdna4.buffer_load(ptr=p_cs + src_pos, offsets=_csk_off), ptr=p_cs + idx * stride_cs_pos, offsets=_csk_off)
                 else:
-                    x_tok = bos + (idx - val)
+                    x_tok = bos + (idx - (STATE_LEN - SPEC_LEN))
                     p_x_tok = x_ptr + x_tok * stride_x_tok
-                    gl.store(p_csq_base + idx * stride_cs_pos,
-                             gl.load(p_x_tok + q_ch_off + o_k).to(p_csq_base.dtype.element_ty))
-                    gl.store(p_csk_base + idx * stride_cs_pos,
-                             gl.load(p_x_tok + k_ch_off + o_k).to(p_csk_base.dtype.element_ty))
+                    gl.amd.cdna4.buffer_store(
+                        gl.amd.cdna4.buffer_load(ptr=p_x_tok + q_ch_off, offsets=o_k).to(conv_state_ptr.dtype.element_ty),
+                        ptr=p_cs + idx * stride_cs_pos, offsets=_csq_off)
+                    gl.amd.cdna4.buffer_store(
+                        gl.amd.cdna4.buffer_load(ptr=p_x_tok + k_ch_off, offsets=o_k).to(conv_state_ptr.dtype.element_ty),
+                        ptr=p_cs + idx * stride_cs_pos, offsets=_csk_off)
 
-        # V conv state — each block writes its chunk
-        p_csv_chunk_base = p_cs + (v_ch_off + o_v_chunk) * stride_cs_dim
-        val = STATE_LEN - seq_T
         for idx in gl.static_range(STATE_LEN):
-            if idx + seq_T < STATE_LEN:
+            if idx + SPEC_LEN < STATE_LEN:
                 src_pos = (i_t_start + 1 + idx) * stride_cs_pos
-                gl.store(p_csv_chunk_base + idx * stride_cs_pos,
-                         gl.load(p_csv_chunk_base + src_pos))
+                gl.amd.cdna4.buffer_store(gl.amd.cdna4.buffer_load(ptr=p_cs + src_pos, offsets=_csv_off), ptr=p_cs + idx * stride_cs_pos, offsets=_csv_off)
             else:
-                x_tok = bos + (idx - val)
+                x_tok = bos + (idx - (STATE_LEN - SPEC_LEN))
                 p_x_tok = x_ptr + x_tok * stride_x_tok
-                gl.store(p_csv_chunk_base + idx * stride_cs_pos,
-                         gl.load(p_x_tok + v_ch_off + o_v_chunk).to(p_csv_chunk_base.dtype.element_ty))
+                gl.amd.cdna4.buffer_store(
+                    gl.amd.cdna4.buffer_load(ptr=p_x_tok + v_ch_off, offsets=o_v_chunk).to(conv_state_ptr.dtype.element_ty),
+                    ptr=p_cs + idx * stride_cs_pos, offsets=_csv_off)
 
 
 # ================================================================
@@ -603,6 +547,7 @@ def fused_kda_decode_gluon(
     out = torch.empty(T, lp, dtype=torch.bfloat16, device=mixed_qkv.device)
 
     STATE_LEN = state_len if state_len is not None else conv_state.shape[2]
+    SPEC_LEN_val = T // batch if batch > 0 else 1
 
     if conv_weight.dim() == 3:
         stride_cw_group = conv_weight.stride(0)
@@ -708,6 +653,7 @@ def fused_kda_decode_gluon(
         BH=BH_val,
         USE_REPLAY=use_replay,
         IS_SPEC=is_spec,
+        SPEC_LEN=SPEC_LEN_val,
         stride_x_tok=mixed_qkv.stride(0),
         stride_cw_group=stride_cw_group,
         stride_cw_width=stride_cw_width,
@@ -729,7 +675,7 @@ def fused_kda_decode_gluon(
         stride_bufg_slot=stride_bufg_slot,
         stride_bufg_hv=stride_bufg_hv,
         stride_bufg_pos=stride_bufg_pos,
-        num_warps=4,
+        num_warps=2,
     )
 
     # Kernel 2: Gated RMSNorm using ATOM's optimized kernel
