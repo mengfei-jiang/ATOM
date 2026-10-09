@@ -1304,90 +1304,79 @@ class KimiKDAAttention(nn.Module):
             if num_actual_tokens <= 64:
                 from atom.model_ops.kimi_k3 import fused_kda_decode_gluon
 
-                fused_out = fused_kda_decode_gluon(
+                fused_kda_decode_gluon(
                     mixed_qkv=mixed_qkv,
                     conv_state=conv_state,
                     conv_weight=conv_weights,
                     gate=gate,
                     beta=beta,
-                    out_gate=out_gate,
                     A_log=self.A_log,
                     dt_bias=self.dt_bias,
                     ssm_state=ssm_state,
                     ssm_state_indices=decode_state_indices,
                     cu_seqlens=query_start_loc[: gdn_metadata.num_decodes + 1],
-                    norm_weight=self.o_norm.weight,
-                    norm_eps=self.config.rms_norm_eps,
                     head_dim=self.head_dim,
                     num_local_heads=self.num_local_heads,
                     lower_bound=self._kda_gate_lower_bound,
-                )
-                return self.o_proj(fused_out)
-            q, k, v = causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                conv_weights,
-                self.local_proj_size,
-                self.local_proj_size,
-                None,
-                self.activation,
-                conv_state_indices=decode_state_indices,
-                validate_data=False,
-            )
-            q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
-            k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
-            v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            # Fused KDA decode: the kernel gathers the initial state from
-            # ssm_state[decode_state_indices], writes the final state back to
-            # the same slots inplace (inplace_final_state), and writes the
-            # recurrence output straight into `out`. This folds the manual
-            # gather / scatter-back / out.copy_ that the fla path required into
-            # one kernel. is_kda + lower_bound select the per-K-channel,
-            # lower-bounded sigmoid gate that Kimi-KDA uses (beta stays raw
-            # logits; the kernel applies sigmoid in fp32 internally).
-            if getattr(kda_metadata, "replayssm", False):
-                # ReplaySSM: one checkpoint per request; the per-token state
-                # snapshots this pool used to hold are rebuilt from the
-                # (k, u, g) records on demand.
-                nd = kda_metadata.num_decodes
-                replayssm_sigmoid_gating_delta_rule(
-                    q,
-                    k,
-                    v,
-                    gate,
-                    beta,
-                    self.A_log,
-                    self.dt_bias,
-                    ckpt=ssm_state,
-                    buf_k=cache.replay_buf_k,
-                    buf_u=cache.replay_buf_u,
-                    buf_g=cache.replay_buf_g,
-                    write_pos=kda_metadata.write_pos,
-                    slot_idx=kda_metadata.slot_idx[:nd],
-                    cu_seqlens=query_start_loc[: nd + 1],
-                    max_query_len=kda_metadata.replayssm_max_query_len,
-                    o=out,
-                    use_qk_l2norm_in_kernel=True,
-                    lower_bound=self._kda_gate_lower_bound,
+                    out=out,
                 )
             else:
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=gate,
-                    b=beta,
-                    dt_bias=self.dt_bias,
-                    q=q,
-                    k=k,
-                    v=v,
-                    o=out,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
-                    ssm_state_indices=decode_state_indices,
-                    use_qk_l2norm_in_kernel=True,
-                    is_kda=True,
-                    lower_bound=self._kda_gate_lower_bound,
+                q, k, v = causal_conv1d_update(
+                    mixed_qkv,
+                    conv_state,
+                    conv_weights,
+                    self.local_proj_size,
+                    self.local_proj_size,
+                    None,
+                    self.activation,
+                    conv_state_indices=decode_state_indices,
+                    validate_data=False,
                 )
+                q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
+                k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
+                v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
+                if getattr(kda_metadata, "replayssm", False):
+                    nd = kda_metadata.num_decodes
+                    replayssm_sigmoid_gating_delta_rule(
+                        q,
+                        k,
+                        v,
+                        gate,
+                        beta,
+                        self.A_log,
+                        self.dt_bias,
+                        ckpt=ssm_state,
+                        buf_k=cache.replay_buf_k,
+                        buf_u=cache.replay_buf_u,
+                        buf_g=cache.replay_buf_g,
+                        write_pos=kda_metadata.write_pos,
+                        slot_idx=kda_metadata.slot_idx[:nd],
+                        cu_seqlens=query_start_loc[: nd + 1],
+                        max_query_len=kda_metadata.replayssm_max_query_len,
+                        o=out,
+                        use_qk_l2norm_in_kernel=True,
+                        lower_bound=self._kda_gate_lower_bound,
+                    )
+                else:
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=gate,
+                        b=beta,
+                        dt_bias=self.dt_bias,
+                        q=q,
+                        k=k,
+                        v=v,
+                        o=out,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=query_start_loc[
+                            : kda_metadata.num_decodes + 1
+                        ],
+                        ssm_state_indices=decode_state_indices,
+                        use_qk_l2norm_in_kernel=True,
+                        is_kda=True,
+                        lower_bound=self._kda_gate_lower_bound,
+                    )
         elif kda_metadata.num_spec_decodes > 0:
             # Speculative-decode pass
             spec_state_indices = kda_metadata.spec_state_indices_tensor

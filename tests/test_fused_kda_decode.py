@@ -3,12 +3,13 @@
 
 """Unit tests for the Gluon fused KDA decode kernel.
 
-Compares the fused kernel (conv1d + recurrence + gated RMSNorm) output
-against the reference 3-kernel implementation.
+Compares the fused kernel (conv1d + recurrence) output, followed by a
+separate rmsnorm_gated call, against the reference 3-kernel implementation.
 """
 
 import pytest
 import torch
+from einops import rearrange
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="GPU required for Triton/Gluon kernels"
@@ -90,7 +91,7 @@ def _reference_kda_decode(
 @pytest.mark.parametrize("D", [128])
 def test_gluon_fused_kda_decode_matches_reference(T, Hloc, D):
     from atom.model_ops.kimi_k3.fused_kda_decode_gluon import fused_kda_decode_gluon
-    from einops import rearrange
+    from atom.model_ops.kimi_k3.activations import rmsnorm_gated
 
     torch.manual_seed(42)
     inputs = _make_inputs(T, Hloc, D)
@@ -111,20 +112,22 @@ def test_gluon_fused_kda_decode_matches_reference(T, Hloc, D):
     )
     out_ref_flat = rearrange(out_ref, "t h d -> t (h d)")
 
-    out_fused = fused_kda_decode_gluon(
+    raw_out = fused_kda_decode_gluon(
         mixed_qkv=inputs["mixed_qkv"], conv_state=conv_state_fused,
         conv_weight=inputs["conv_weight"], gate=inputs["gate"],
-        beta=inputs["beta"], out_gate=inputs["out_gate"],
+        beta=inputs["beta"],
         A_log=inputs["A_log"], dt_bias=inputs["dt_bias"],
         ssm_state=ssm_state_fused,
         ssm_state_indices=inputs["ssm_state_indices"],
         cu_seqlens=inputs["cu_seqlens"],
-        norm_weight=inputs["norm_weight"], norm_eps=norm_eps,
         head_dim=D, num_local_heads=Hloc, lower_bound=lower_bound,
     )
+    gate_3d = rearrange(inputs["out_gate"][:T], "t (h d) -> t h d", d=D)
+    out_fused = rmsnorm_gated(raw_out, inputs["norm_weight"], gate_3d, norm_eps)
+    out_fused_flat = rearrange(out_fused, "t h d -> t (h d)")
 
     torch.testing.assert_close(
-        out_fused.float(), out_ref_flat.float(), atol=0.02, rtol=0.01,
+        out_fused_flat.float(), out_ref_flat.float(), atol=0.02, rtol=0.01,
         msg="Gluon fused output diverges from reference",
     )
     torch.testing.assert_close(
@@ -150,12 +153,11 @@ def test_gluon_fused_kda_decode_pad_slot():
     fused_kda_decode_gluon(
         mixed_qkv=inputs["mixed_qkv"], conv_state=inputs["conv_state"],
         conv_weight=inputs["conv_weight"], gate=inputs["gate"],
-        beta=inputs["beta"], out_gate=inputs["out_gate"],
+        beta=inputs["beta"],
         A_log=inputs["A_log"], dt_bias=inputs["dt_bias"],
         ssm_state=inputs["ssm_state"],
         ssm_state_indices=inputs["ssm_state_indices"],
         cu_seqlens=inputs["cu_seqlens"],
-        norm_weight=inputs["norm_weight"], norm_eps=1e-6,
         head_dim=128, num_local_heads=2, lower_bound=-5.0,
     )
 
@@ -257,14 +259,11 @@ def test_gluon_spec_conv_state_writeback(batch, Hloc, seq_per_batch):
         conv_weight=inputs["conv_weight"],
         gate=inputs["gate"],
         beta=inputs["beta"],
-        out_gate=inputs["out_gate"],
         A_log=inputs["A_log"],
         dt_bias=inputs["dt_bias"],
         ssm_state=inputs["ssm_state"],
         ssm_state_indices=inputs["ssm_state_indices"],
         cu_seqlens=inputs["cu_seqlens"],
-        norm_weight=inputs["norm_weight"],
-        norm_eps=1e-6,
         head_dim=D,
         num_local_heads=Hloc,
         lower_bound=-5.0,
@@ -344,14 +343,11 @@ def test_gluon_spec_dspark_snapshot(batch, Hloc, seq_per_batch):
         conv_weight=inputs["conv_weight"],
         gate=inputs["gate"],
         beta=inputs["beta"],
-        out_gate=inputs["out_gate"],
         A_log=inputs["A_log"],
         dt_bias=inputs["dt_bias"],
         ssm_state=ssm_state_ext,
         ssm_state_indices=inputs["ssm_state_indices"],
         cu_seqlens=inputs["cu_seqlens"],
-        norm_weight=inputs["norm_weight"],
-        norm_eps=1e-6,
         head_dim=D,
         num_local_heads=Hloc,
         lower_bound=-5.0,
@@ -418,14 +414,11 @@ def test_gluon_conv_state_indices_separate():
         conv_weight=inputs["conv_weight"],
         gate=inputs["gate"],
         beta=inputs["beta"],
-        out_gate=inputs["out_gate"],
         A_log=inputs["A_log"],
         dt_bias=inputs["dt_bias"],
         ssm_state=inputs["ssm_state"],
         ssm_state_indices=ssm_indices,
         cu_seqlens=inputs["cu_seqlens"],
-        norm_weight=inputs["norm_weight"],
-        norm_eps=1e-6,
         head_dim=D,
         num_local_heads=Hloc,
         lower_bound=-5.0,
@@ -540,14 +533,11 @@ def test_gluon_replay_basic(batch, h_cursor_val):
         conv_weight=inp["conv_weight"],
         gate=inp["gate"],
         beta=inp["beta"],
-        out_gate=inp["out_gate"],
         A_log=inp["A_log"],
         dt_bias=inp["dt_bias"],
         ssm_state=inp["ssm_state"],
         ssm_state_indices=inp["ssm_state_indices"],
         cu_seqlens=inp["cu_seqlens"],
-        norm_weight=inp["norm_weight"],
-        norm_eps=1e-6,
         head_dim=D,
         num_local_heads=Hloc,
         lower_bound=-5.0,
@@ -602,14 +592,11 @@ def test_gluon_replay_flush(batch):
         conv_weight=inp["conv_weight"],
         gate=inp["gate"],
         beta=inp["beta"],
-        out_gate=inp["out_gate"],
         A_log=inp["A_log"],
         dt_bias=inp["dt_bias"],
         ssm_state=inp["ssm_state"],
         ssm_state_indices=inp["ssm_state_indices"],
         cu_seqlens=inp["cu_seqlens"],
-        norm_weight=inp["norm_weight"],
-        norm_eps=1e-6,
         head_dim=D,
         num_local_heads=Hloc,
         lower_bound=-5.0,
@@ -717,14 +704,11 @@ def test_gluon_replay_spec_combined():
         conv_weight=inp["conv_weight"],
         gate=inp["gate"],
         beta=inp["beta"],
-        out_gate=inp["out_gate"],
         A_log=inp["A_log"],
         dt_bias=inp["dt_bias"],
         ssm_state=inp["ssm_state"],
         ssm_state_indices=inp["ssm_state_indices"],
         cu_seqlens=inp["cu_seqlens"],
-        norm_weight=inp["norm_weight"],
-        norm_eps=1e-6,
         head_dim=D,
         num_local_heads=Hloc,
         lower_bound=-5.0,
@@ -744,7 +728,8 @@ def test_gluon_replay_spec_combined():
         bh=bh,
     )
 
-    assert out.shape == (batch * seq_per_batch, lp)
+    # Output is now [T, H, V] un-normalized; check shape accordingly
+    assert out.shape == (batch * seq_per_batch, Hloc, D)
     assert not torch.isnan(out).any(), "NaN in output"
 
     # Ring buffer should have new records at base + i_t
@@ -768,7 +753,6 @@ def test_gluon_vs_3kernel_device_time():
     launch-overhead advantage disappears, so we only assert correctness here and
     report timings for manual inspection.
     """
-    from einops import rearrange
     from atom.model_ops.kimi_k3.fused_kda_decode_gluon import fused_kda_decode_gluon
     from atom.model_ops.fla_ops.fused_sigmoid_gating import fused_sigmoid_gating_delta_rule_update
     from atom.model_ops.kimi_k3.activations import rmsnorm_gated
@@ -777,9 +761,11 @@ def test_gluon_vs_3kernel_device_time():
     torch.manual_seed(42)
     D = 128; Hloc = 8; T = 1; batch = 64
     lp = Hloc * D
+    norm_eps = 1e-6
     inputs = _make_inputs(T * batch, Hloc, D)
     inputs["ssm_state_indices"] = torch.arange(batch, dtype=torch.int32, device="cuda")
     inputs["cu_seqlens"] = torch.arange(batch + 1, dtype=torch.int64, device="cuda")
+    gate_3d = rearrange(inputs["out_gate"], "t (h d)->t h d", d=D)
 
     def run_3k():
         cs = inputs["conv_state"].clone(); ss = inputs["ssm_state"].clone()
@@ -797,19 +783,19 @@ def test_gluon_vs_3kernel_device_time():
             cu_seqlens=inputs["cu_seqlens"],
             ssm_state_indices=inputs["ssm_state_indices"],
             use_qk_l2norm_in_kernel=True, is_kda=True, lower_bound=-5.0)
-        return rmsnorm_gated(out, inputs["norm_weight"],
-                            rearrange(inputs["out_gate"], "t (h d)->t h d", d=D), 1e-6)
+        return rmsnorm_gated(out, inputs["norm_weight"], gate_3d, norm_eps)
 
     def run_gluon():
         cs = inputs["conv_state"].clone(); ss = inputs["ssm_state"].clone()
-        return fused_kda_decode_gluon(
+        raw_out = fused_kda_decode_gluon(
             mixed_qkv=inputs["mixed_qkv"], conv_state=cs,
             conv_weight=inputs["conv_weight"], gate=inputs["gate"],
-            beta=inputs["beta"], out_gate=inputs["out_gate"],
+            beta=inputs["beta"],
             A_log=inputs["A_log"], dt_bias=inputs["dt_bias"],
             ssm_state=ss, ssm_state_indices=inputs["ssm_state_indices"],
-            cu_seqlens=inputs["cu_seqlens"], norm_weight=inputs["norm_weight"],
-            norm_eps=1e-6, head_dim=D, num_local_heads=Hloc, lower_bound=-5.0)
+            cu_seqlens=inputs["cu_seqlens"],
+            head_dim=D, num_local_heads=Hloc, lower_bound=-5.0)
+        return rmsnorm_gated(raw_out, inputs["norm_weight"], gate_3d, norm_eps)
 
     for _ in range(5):
         run_3k(); run_gluon()

@@ -497,14 +497,11 @@ def fused_kda_decode_gluon(
     conv_weight: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
-    out_gate: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     ssm_state: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
     head_dim: int,
     num_local_heads: int,
     lower_bound: float,
@@ -522,10 +519,16 @@ def fused_kda_decode_gluon(
     slot_idx: torch.Tensor | None = None,
     cap: int | None = None,
     bh: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fused KDA decode: conv1d + recurrence (gluon) + gated RMSNorm (ATOM)."""
-    from atom.model_ops.kimi_k3.activations import rmsnorm_gated as atom_rmsnorm_gated
+    """Fused KDA decode: conv1d + recurrence (gluon kernel only).
 
+    Writes the un-normalized recurrence output into ``out`` shaped
+    ``[T, H, V]`` (or allocates a fresh tensor when ``out`` is None).
+    The caller applies gated RMSNorm + optional quantisation via
+    ``self.o_norm`` so the fused path shares the same norm/quant
+    logic as the three-kernel fallback.
+    """
     T = mixed_qkv.shape[0]
     K = V = head_dim
     H = num_local_heads
@@ -544,7 +547,9 @@ def fused_kda_decode_gluon(
         while batch * H * (V // CHUNK_V) > max_blocks and CHUNK_V < V:
             CHUNK_V *= 2
     N_CHUNKS = triton.cdiv(V, CHUNK_V)
-    out = torch.empty(T, lp, dtype=torch.bfloat16, device=mixed_qkv.device)
+    if out is None:
+        out = torch.empty(T, H, V, dtype=torch.bfloat16, device=mixed_qkv.device)
+    out_flat = out.view(T, lp)
 
     STATE_LEN = state_len if state_len is not None else conv_state.shape[2]
     SPEC_LEN_val = T // batch if batch > 0 else 1
@@ -629,7 +634,7 @@ def fused_kda_decode_gluon(
         ssm_state,
         ssm_state_indices,
         cu_seqlens,
-        out,
+        out_flat,
         num_accepted_tokens,
         state_indices,
         conv_state_indices,
@@ -678,8 +683,4 @@ def fused_kda_decode_gluon(
         num_warps=2,
     )
 
-    # Kernel 2: Gated RMSNorm using ATOM's optimized kernel
-    out_3d = out.view(T, H, V)
-    gate_3d = out_gate.reshape(T, H, V)
-    normed = atom_rmsnorm_gated(out_3d, norm_weight, gate_3d, norm_eps)
-    return normed.view(T, lp)
+    return out
