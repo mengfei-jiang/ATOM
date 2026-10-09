@@ -548,8 +548,6 @@ def test_gluon_replay_basic(batch, h_cursor_val):
         buf_g=inp["buf_g"],
         write_pos=inp["write_pos"],
         slot_idx=inp["slot_idx"],
-        cap=cap,
-        bh=bh,
     )
 
     # No flush → checkpoint unchanged
@@ -607,8 +605,6 @@ def test_gluon_replay_flush(batch):
         buf_g=inp["buf_g"],
         write_pos=inp["write_pos"],
         slot_idx=inp["slot_idx"],
-        cap=cap,
-        bh=bh,
     )
 
     # Flush → checkpoint should be updated (replayed state)
@@ -724,8 +720,6 @@ def test_gluon_replay_spec_combined():
         buf_g=inp["buf_g"],
         write_pos=inp["write_pos"],
         slot_idx=inp["slot_idx"],
-        cap=cap,
-        bh=bh,
     )
 
     # Output is now [T, H, V] un-normalized; check shape accordingly

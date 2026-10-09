@@ -1382,81 +1382,99 @@ class KimiKDAAttention(nn.Module):
             spec_state_indices = kda_metadata.spec_state_indices_tensor
             spec_query_start_loc = kda_metadata.spec_query_start_loc
             num_accepted_tokens = kda_metadata.num_accepted_tokens
-            q, k, v = causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                conv_weights,
-                self.local_proj_size,
-                self.local_proj_size,
-                None,
-                self.activation,
-                # First reserved slot per seq holds the resume state; the kernel
-                # walks forward via num_accepted_tokens + query_start_loc.
-                conv_state_indices=spec_state_indices[:, 0][
-                    : kda_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                # Verify window: sizes the conv rollback window and hence the
-                # kernel's NP2_STATELEN tile. Under ReplaySSM the slot table
-                # keeps its [bs, mtp_k+1] shape but only column 0 is live, so
-                # read the window off the metadata instead of the table width.
-                max_query_len=(
-                    kda_metadata.replayssm_max_query_len
-                    if getattr(kda_metadata, "replayssm", False)
-                    else spec_state_indices.size(-1)
-                ),
-                validate_data=False,
-            )
-            q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
-            k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
-            v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            if getattr(kda_metadata, "replayssm", False):
-                nsd = kda_metadata.num_spec_decodes
-                replayssm_sigmoid_gating_delta_rule(
-                    q,
-                    k,
-                    v,
-                    gate,
-                    beta,
-                    self.A_log,
-                    self.dt_bias,
-                    ckpt=ssm_state,
-                    buf_k=cache.replay_buf_k,
-                    buf_u=cache.replay_buf_u,
-                    buf_g=cache.replay_buf_g,
-                    write_pos=kda_metadata.write_pos,
-                    slot_idx=kda_metadata.slot_idx[:nsd],
+            nsd = kda_metadata.num_spec_decodes
+            is_replay = getattr(kda_metadata, "replayssm", False)
+            if nsd <= 64:
+                spec_conv_indices = spec_state_indices[:, 0][:nsd].to(
+                    torch.int64
+                )
+                from atom.model_ops.kimi_k3 import fused_kda_decode_gluon
+
+                replay_kwargs = {}
+                if is_replay:
+                    replay_kwargs = dict(
+                        use_replay=True,
+                        ckpt=ssm_state,
+                        buf_k=cache.replay_buf_k,
+                        buf_u=cache.replay_buf_u,
+                        buf_g=cache.replay_buf_g,
+                        write_pos=kda_metadata.write_pos,
+                        slot_idx=kda_metadata.slot_idx[:nsd],
+                    )
+                fused_kda_decode_gluon(
+                    mixed_qkv=mixed_qkv,
+                    conv_state=conv_state,
+                    conv_weight=conv_weights,
+                    gate=gate,
+                    beta=beta,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    ssm_state=ssm_state,
+                    ssm_state_indices=spec_conv_indices.to(torch.int32),
                     cu_seqlens=spec_query_start_loc[: nsd + 1],
-                    max_query_len=kda_metadata.replayssm_max_query_len,
-                    o=out,
-                    use_qk_l2norm_in_kernel=True,
+                    head_dim=self.head_dim,
+                    num_local_heads=self.num_local_heads,
                     lower_bound=self._kda_gate_lower_bound,
+                    is_spec=True,
+                    num_accepted_tokens=num_accepted_tokens,
+                    state_indices=spec_state_indices,
+                    state_len=conv_state.shape[2],
+                    conv_state_indices=spec_conv_indices,
+                    out=out,
+                    **replay_kwargs,
                 )
             else:
-                fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
-                    a=gate,
-                    b=beta,
-                    dt_bias=self.dt_bias,
-                    q=q,
-                    k=k,
-                    v=v,
-                    o=out,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=spec_query_start_loc[
-                        : kda_metadata.num_spec_decodes + 1
-                    ],
-                    # 2D [bs, 1+num_spec]: per-token snapshot slots. Paired with
-                    # num_accepted_tokens the kernel reads the resume state from
-                    # slot[num_accepted-1] and writes a snapshot after each token.
-                    ssm_state_indices=spec_state_indices,
+                q, k, v = causal_conv1d_update(
+                    mixed_qkv,
+                    conv_state,
+                    conv_weights,
+                    self.local_proj_size,
+                    self.local_proj_size,
+                    None,
+                    self.activation,
+                    conv_state_indices=spec_state_indices[:, 0][:nsd],
                     num_accepted_tokens=num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
-                    is_kda=True,
-                    lower_bound=self._kda_gate_lower_bound,
+                    query_start_loc=spec_query_start_loc,
+                    max_query_len=(
+                        kda_metadata.replayssm_max_query_len
+                        if is_replay
+                        else spec_state_indices.size(-1)
+                    ),
+                    validate_data=False,
                 )
+                q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
+                k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
+                v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
+                if is_replay:
+                    replayssm_sigmoid_gating_delta_rule(
+                        q, k, v, gate, beta,
+                        self.A_log, self.dt_bias,
+                        ckpt=ssm_state,
+                        buf_k=cache.replay_buf_k,
+                        buf_u=cache.replay_buf_u,
+                        buf_g=cache.replay_buf_g,
+                        write_pos=kda_metadata.write_pos,
+                        slot_idx=kda_metadata.slot_idx[:nsd],
+                        cu_seqlens=spec_query_start_loc[: nsd + 1],
+                        max_query_len=kda_metadata.replayssm_max_query_len,
+                        o=out,
+                        use_qk_l2norm_in_kernel=True,
+                        lower_bound=self._kda_gate_lower_bound,
+                    )
+                else:
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log, a=gate, b=beta,
+                        dt_bias=self.dt_bias,
+                        q=q, k=k, v=v, o=out,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[: nsd + 1],
+                        ssm_state_indices=spec_state_indices,
+                        num_accepted_tokens=num_accepted_tokens,
+                        use_qk_l2norm_in_kernel=True,
+                        is_kda=True,
+                        lower_bound=self._kda_gate_lower_bound,
+                    )
         else:
             out.zero_()
 

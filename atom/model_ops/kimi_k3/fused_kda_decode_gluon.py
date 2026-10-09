@@ -517,8 +517,6 @@ def fused_kda_decode_gluon(
     buf_g: torch.Tensor | None = None,
     write_pos: torch.Tensor | None = None,
     slot_idx: torch.Tensor | None = None,
-    cap: int | None = None,
-    bh: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused KDA decode: conv1d + recurrence (gluon kernel only).
@@ -607,7 +605,6 @@ def fused_kda_decode_gluon(
         assert ckpt is not None
         assert buf_k is not None and buf_u is not None and buf_g is not None
         assert write_pos is not None and slot_idx is not None
-        assert cap is not None and bh is not None
         stride_ckpt_slot = ckpt.stride(0)
         stride_bufk_slot = buf_k.stride(0)
         stride_bufk_hv = buf_k.stride(1)
@@ -618,8 +615,9 @@ def fused_kda_decode_gluon(
         stride_bufg_slot = buf_g.stride(0)
         stride_bufg_hv = buf_g.stride(1)
         stride_bufg_pos = buf_g.stride(2)
-        CAP_val = cap
-        BH_val = bh
+        CAP_val = buf_k.shape[2]
+        SPEC_LEN_val_for_bh = T // batch if batch > 0 else 1
+        BH_val = max(16, 1 << (CAP_val - SPEC_LEN_val_for_bh - 1).bit_length())
 
     # Kernel 1: Conv1d + Recurrence (V tiled across grid axis 2)
     grid = (batch, H, N_CHUNKS)
